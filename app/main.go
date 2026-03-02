@@ -30,7 +30,7 @@ type BrokerPeers []string
 
 type PeerConnMap struct {
 	Mu    sync.Mutex
-	Peers map[string]net.Conn
+	Peers map[int32]net.Conn
 }
 
 func (bp *BrokerPeers) String() string {
@@ -307,13 +307,22 @@ func main() {
 		log.Fatalf("Error initializing kraft combined logs directory: %v\n", err)
 	}
 
-	PeerConns.Peers = make(map[string]net.Conn)
-
-	go handleBroker(lnServe)
+	PeerConns.Peers = make(map[int32]net.Conn)
+	wg := sync.WaitGroup{}
+	wg.Add(len(Configuration.Peers)) // outbound dials
+	wg.Add(len(Configuration.Peers)) // Inbound accepts
+	go handleBroker(lnServe, &wg)
 	for _, peer := range Configuration.Peers {
-		go handleDial(peer)
+		go handleDial(peer, &wg)
 	}
-
+	wg.Wait()
+	// this should be blocking because we do not want to accept client conns until each broker is configured properly
+	requestMetadata() // each broker besides controller will send request metadata to controller
+	wg.Add(len(Configuration.Peers))
+	for brokerId, connection := range PeerConns.Peers {
+		go sendMetadata(brokerId, connection, &wg)
+	}
+	wg.Wait()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -324,59 +333,132 @@ func main() {
 		go handleConnection(conn)
 	}
 }
-func handleBroker(lnServe net.Listener) {
-	clusterMetadataPath := Configuration.DataDir + "/tmp/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log"
-	for {
+func sendMetadata(brokerId int32, conn net.Conn, wg *sync.WaitGroup) {
+	defer wg.Done()
+	clusterMetadataFilePath := fmt.Sprintf("%s/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log", Configuration.DataDir)
+	if Configuration.BrokerId != 0 {
+		return
+	}
+	log.Printf("Handling send metadata for broker: %d\n", brokerId)
+	hasMetadataBytes := make([]byte, 1)
+	var hasMetadataFlag int8
+
+	conn.Read(hasMetadataBytes)
+	binary.Read(bytes.NewReader(hasMetadataBytes), binary.BigEndian, &hasMetadataFlag)
+
+	if hasMetadataFlag == int8(0) {
+		log.Printf("Broker %d does not have the cluster metadata file\n", brokerId)
+		metadataFile, err := os.OpenFile(clusterMetadataFilePath, os.O_RDONLY, 0777)
+		if err != nil {
+			log.Printf("Error opening cluster metadata file: %v\n", err)
+			return
+		}
+		metadataFileBytes, err := io.ReadAll(metadataFile)
+		if err != nil {
+			log.Printf("Error reading cluster metadata file: %v\n", err)
+		}
+		metadataFileLength := int32(len(metadataFileBytes))
+		buf := new(bytes.Buffer)
+
+		binary.Write(buf, binary.BigEndian, metadataFileLength)
+		conn.Write(buf.Bytes()) // write cluster metadata length
+		// now write the whole file
+		log.Printf("Sent cluster metadata file length as num bytes (int32): %d\n", metadataFileLength)
+		n, err := conn.Write(metadataFileBytes)
+		if err != nil {
+			log.Printf("Error writing cluster metadata from broker 0 to peer: %d\n", brokerId)
+		}
+		log.Printf("Wrote %d bytes to peer %d\n", n, brokerId)
+	}
+
+}
+func requestMetadata() {
+	clusterMetadataFilePath := fmt.Sprintf("%s/kraft-combined-logs/__cluster_metadata-0/00000000000000000000.log", Configuration.DataDir)
+	if Configuration.BrokerId == 0 {
+		return
+	}
+	controllerCon := PeerConns.Peers[int32(0)]
+	var has_metadata int8
+	if fileExists(clusterMetadataFilePath) {
+		has_metadata = int8(1)
+		log.Printf("Cluster Metadata file already exists in expected location for %d\n", Configuration.BrokerId)
+	} else {
+		log.Printf("Broker with id %d does not have the Cluster Metadata file\n", Configuration.BrokerId)
+	}
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, has_metadata)
+	log.Println("Writing has_metadata flag to controller broker")
+	controllerCon.Write(buf.Bytes())
+	if has_metadata == int8(0) {
+		// controller will respond with the length of the cluster metadata file as int32
+		// and then the contents of the file themselves
+		var clusterMetadataFileLength int32
+		fileLengthBytes := make([]byte, 4)
+		controllerCon.Read(fileLengthBytes)
+		binary.Read(bytes.NewReader(fileLengthBytes), binary.BigEndian, &clusterMetadataFileLength)
+
+		metadataFileBytes := make([]byte, clusterMetadataFileLength)
+		bytesRead := 0
+		for {
+			if int32(bytesRead) == clusterMetadataFileLength {
+				break
+			}
+			n, err := controllerCon.Read(metadataFileBytes)
+			if err != nil {
+				if err == io.EOF {
+					log.Println("Client closed connection")
+					return
+				}
+				log.Printf("Faled to read bytes from channel while reading cluster metadata file: %v", err)
+				return
+			}
+			bytesRead += n
+		}
+		metadataFile, err := os.OpenFile(clusterMetadataFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0777)
+		if err != nil {
+			log.Printf("Error creating or opening cluster metadata file: %v", err)
+			return
+		}
+		defer metadataFile.Close()
+		metadataFile.Write(metadataFileBytes)
+	}
+}
+func handleBroker(lnServe net.Listener, wg *sync.WaitGroup) {
+	acceptedConnectionCount := 0
+	expectedConnectionNum := len(Configuration.Peers)
+	for expectedConnectionNum > acceptedConnectionCount {
 		conn, err := lnServe.Accept()
 		if err != nil {
 			log.Fatalf("Error acception connection made to server from broker: %v\n", err)
 			continue
 		}
-		log.Printf("Accepted new broker connection from %v\n", conn.RemoteAddr())
-		buf := new(bytes.Buffer)
-		binary.Write(buf, binary.BigEndian, int32(Configuration.BrokerId))
-		conn.Write(buf.Bytes())
-
-		brokerIdPeerBytes := make([]byte, 4)
-		conn.Read(brokerIdPeerBytes)
-
-		var brokerIdPeer int32
-		binary.Read(bytes.NewReader(brokerIdPeerBytes), binary.BigEndian, &brokerIdPeer)
-		if brokerIdPeer == int32(0) {
-			// if the broker we are connected to is the controller broker which has id 0
-			var has_metadata int8
-			if fileExists(clusterMetadataPath) {
-				// if cluster metadata file already exists this broker already has the file
-				has_metadata = int8(1)
-			}
-			newBuf := new(bytes.Buffer)
-			binary.Write(newBuf, binary.BigEndian, has_metadata)
-			conn.Write(newBuf.Bytes())
-			// receive broker 0's cluster metadata file
-			if has_metadata == 0 {
-				// read length of cluster metadata file int32
-				metadataFileLengthBytes := make([]byte, 4)
-				var metadataFileLength int32
-				conn.Read(metadataFileLengthBytes)
-				binary.Read(bytes.NewReader(metadataFileLengthBytes), binary.BigEndian, &metadataFileLength)
-
-				metadataFileBytes := make([]byte, metadataFileLength)
-				conn.Read(metadataFileBytes)
-			}
-
-		} else if Configuration.BrokerId == 0 {
-
-		}
-		if brokerIdPeer < int32(Configuration.BrokerId) {
-			PeerConns.Mu.Lock()
-			PeerConns.Peers[conn.RemoteAddr().String()] = conn
-			PeerConns.Mu.Unlock()
-		} else {
-			conn.Close()
-		}
+		go handleInitHandshake(conn, wg)
+		acceptedConnectionCount++
 	}
 }
-func handleDial(peerAddr string) {
+func handleInitHandshake(conn net.Conn, wg *sync.WaitGroup) {
+	defer wg.Done()
+	log.Printf("Accepted new broker connection from %v\n", conn.RemoteAddr())
+	buf := new(bytes.Buffer)
+	binary.Write(buf, binary.BigEndian, int32(Configuration.BrokerId))
+	conn.Write(buf.Bytes())
+
+	brokerIdPeerBytes := make([]byte, 4)
+	conn.Read(brokerIdPeerBytes)
+
+	var brokerIdPeer int32
+	binary.Read(bytes.NewReader(brokerIdPeerBytes), binary.BigEndian, &brokerIdPeer)
+
+	if brokerIdPeer < int32(Configuration.BrokerId) {
+		PeerConns.Mu.Lock()
+		PeerConns.Peers[brokerIdPeer] = conn
+		PeerConns.Mu.Unlock()
+	} else {
+		conn.Close()
+	}
+}
+func handleDial(peerAddr string, wg *sync.WaitGroup) {
+	defer wg.Done()
 	retry := 0
 	maxRetry := 5
 	for {
@@ -402,7 +484,7 @@ func handleDial(peerAddr string) {
 
 			} else {
 				PeerConns.Mu.Lock()
-				PeerConns.Peers[peerAddr] = conn
+				PeerConns.Peers[brokerIdPeer] = conn
 				PeerConns.Mu.Unlock()
 			}
 			return
